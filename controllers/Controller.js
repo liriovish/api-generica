@@ -5,6 +5,8 @@ const { getDatabase } = database;
 import { sendToQueue } from '../services/rabbitmqService.js';
 import fs from 'fs';
 import path from 'path';
+import mongoose from 'mongoose';
+
 
 // Rota GET /v1/tabelas
 export async function listarTabelas(req, res) {
@@ -51,61 +53,71 @@ export async function listarTabelas(req, res) {
 
 // Rota GET /v1/listagem
 export async function listarDados(req, res) {
+    // Pegando os parâmetros da query
     const { nomeTabela, campo, tipoFiltro, valor, pagina = 1, numeroRegistros = 100 } = req.query;
 
-    if (nomeTabela === 'SIGLA_DB_exportacoes') {
-        const db = getDatabase();
-        let dados, totalRegistros;
+    // Verifica se o nome da tabela foi fornecido
+    if (!nomeTabela) {
+        return res.status(400).json({ error: 'Nome da tabela não fornecido.' });
+    }
 
-        try {
-            if (process.env.SIGLA_DB === 'mongodb') {
-                // Filtragem para MongoDB
-                let query = {};
-                if (campo && tipoFiltro && valor) {
-                    // Cria o filtro dinâmico com base nos campos fornecidos
-                    campo.forEach((field, index) => {
-                        query[field] = { [`$${tipoFiltro[index]}`]: valor[index] };
-                    });
-                }
-                dados = await MongoExportacao.find(query)
-                    .limit(Number(numeroRegistros))
-                    .skip((pagina - 1) * numeroRegistros);
-                totalRegistros = await MongoExportacao.countDocuments(query);
-            } else {
-                // Filtragem para MySQL (com Sequelize)
-                const sequelize = await db.authenticate();
-                const ExportacaoSQL = defineExportacaoSQL(sequelize);
+    const db = getDatabase();
+    let dados, totalRegistros;
 
-                let whereClause = {};
-                if (campo && tipoFiltro && valor) {
-                    // Cria o filtro dinâmico com base nos campos fornecidos
-                    campo.forEach((field, index) => {
-                        whereClause[field] = { [Sequelize.Op[tipoFiltro[index]]]: valor[index] };
-                    });
-                }
+    try {
+        if (process.env.SIGLA_DB === 'mongodb') {
+            // Conectar ao MongoDB e acessar a coleção com o nome fornecido
+            const collection = mongoose.connection.db.collection(nomeTabela);
 
-                // Busca os dados com filtragem e paginação
-                dados = await ExportacaoSQL.findAll({
-                    where: whereClause,
-                    limit: Number(numeroRegistros),
-                    offset: (pagina - 1) * numeroRegistros
-                });
-                totalRegistros = await ExportacaoSQL.count({ where: whereClause });
+            if (!collection) {
+                return res.status(400).json({ error: 'Tabela não encontrada no banco de dados.' });
             }
 
-            // Retorna os dados com a contagem e paginação
-            res.json({
-                totalRegistros,
-                totalPaginas: Math.ceil(totalRegistros / numeroRegistros),
-                dados
-            });
-        } catch (error) {
-            console.error('Erro ao listar dados:', error);
-            res.status(500).json({ error: 'Erro ao listar dados' });
+            let query = {};
+
+            // Aplica filtros, se fornecidos
+            if (campo && tipoFiltro && valor) {
+                campo.forEach((field, index) => {
+                    query[field] = { [`$${tipoFiltro[index]}`]: valor[index] };  // Cria o filtro dinâmico
+                });
+            }
+
+            // Realiza a consulta no MongoDB com paginação
+            dados = await collection.find(query)
+                .limit(Number(numeroRegistros))
+                .skip((pagina - 1) * numeroRegistros)
+                .toArray();
+
+            totalRegistros = await collection.countDocuments(query);
+
+        } else {
+            // Conexão com MySQL usando Sequelize
+            if (!nomeTabela) {
+                return res.status(400).json({ error: 'Nome da tabela não fornecido.' });
+            }
+
+            const sequelize = await db.authenticate();
+            const model = sequelize.models[nomeTabela];  // Acessa o modelo da tabela no Sequelize
+
+            if (!model) {
+                return res.status(400).json({ error: 'Tabela não encontrada no banco de dados.' });
+            }
+
+            // Busca os dados da tabela sem filtros
+            dados = await model.findAll();
+            totalRegistros = dados.length;
         }
-    } else {
-        // Caso a tabela seja inválida
-        res.status(400).json({ error: 'Tabela inválida' });
+
+        // Retorna os dados com a contagem e paginação
+        res.json({
+            totalRegistros,
+            totalPaginas: Math.ceil(totalRegistros / numeroRegistros),  // Calcula total de páginas
+            dados
+        });
+
+    } catch (error) {
+        console.error('Erro ao listar dados:', error);
+        res.status(500).json({ error: 'Erro ao listar dados' });
     }
 }
 
@@ -113,34 +125,51 @@ export async function listarDados(req, res) {
 export async function solicitarExportacao(req, res) {
     const { nomeTabela, campo, tipoFiltro, valor } = req.body;
 
+    // Verifica se todos os campos obrigatórios estão presentes
+    if (!nomeTabela || !Array.isArray(campo) || !Array.isArray(tipoFiltro) || !Array.isArray(valor)) {
+        return res.status(400).json({ error: 'Parâmetros inválidos ou faltando' });
+    }
+
+    // Criação da exportação com os dados fornecidos
     const novaExportacao = {
-        hash: uuidv4(),
-        filtros: { campo, tipoFiltro, valor },
-        situacao: 0, // Solicitada
-        dataCadastro: new Date(),
-        dataGeracao: null,
-        dataExclusao: null,
-        tentativasProcessamento: 0,
+        hash: uuidv4(),  // Geração do hash único para a exportação
+        filtros: { campo, tipoFiltro, valor },  // Filtros passados na requisição
+        situacao: 0,  // Estado inicial: Solicitada
+        dataCadastro: new Date(),  // Data de cadastro
+        dataGeracao: null,  // Data de geração será definida após o processamento
+        dataExclusao: null,  // Data de exclusão, se necessário
+        tentativasProcessamento: 0,  // Contador de tentativas de processamento
     };
 
     let exportacao;
-    if (process.env.SIGLA_DB === 'mongodb') {
-        exportacao = new MongoExportacao(novaExportacao);
-        await exportacao.save();
-    } else {
-        const sequelize = getDatabase();
-        const ExportacaoSQL = defineExportacaoSQL(sequelize);
-        exportacao = await ExportacaoSQL.create(novaExportacao);
+
+    try {
+        if (process.env.SIGLA_DB === 'mongodb') {
+            // Se o banco for MongoDB, cria um novo registro na coleção MongoExportacao
+            exportacao = new MongoExportacao(novaExportacao);
+            await exportacao.save();
+        } else {
+            // Se o banco for MySQL, usa o Sequelize para salvar o registro
+            const sequelize = getDatabase();
+            const ExportacaoSQL = defineExportacaoSQL(sequelize);  // Modelo de exportação no Sequelize
+            exportacao = await ExportacaoSQL.create(novaExportacao);
+        }
+
+        // Enviar uma mensagem para o RabbitMQ com os dados da exportação solicitada
+        await sendToQueue({
+            hash: exportacao.hash,
+            nomeTabela,
+            filtros: novaExportacao.filtros,
+            dataSolicitacao: new Date()
+        });
+
+        // Retorna o hash da exportação para o cliente
+        return res.json({ hash: exportacao.hash });
+
+    } catch (error) {
+        console.error('Erro ao solicitar exportação:', error);
+        return res.status(500).json({ error: 'Erro ao solicitar exportação' });
     }
-
-    await sendToQueue({
-        hash: exportacao.hash,
-        nomeTabela,
-        filtros: novaExportacao.filtros,
-        dataSolicitacao: new Date()
-    });
-
-    res.json({ hash: exportacao.hash });
 }
 
 // Rota GET /v1/exportacao
