@@ -37,15 +37,28 @@ async function sendToQueue(message) {
 
 // Função para consumir mensagens da fila
 async function consumeQueue(callback) {
+    // Conecta e assegura que o canal está configurado
     if (!channel) {
         await connect();
     }
+
+    // Começa a consumir mensagens da fila
     channel.consume(process.env.NOME_FILA_RABBITMQ, async (msg) => {
         if (msg !== null) {
-            const messageContent = JSON.parse(msg.content.toString());
-            console.log('Mensagem recebida da fila:', messageContent);
-            await callback(messageContent);
-            channel.ack(msg);
+            try {
+                // Converte o conteúdo da mensagem e passa para o callback
+                const messageContent = JSON.parse(msg.content.toString());
+                console.log('Mensagem recebida da fila:', messageContent);
+
+                // Executa o callback para processar a mensagem
+                await callback(messageContent);
+
+                // Confirma que a mensagem foi processada
+                channel.ack(msg);
+            } catch (error) {
+                console.error('Erro ao processar mensagem:', error);
+                // Caso haja um erro, a mensagem não é confirmada, e o RabbitMQ a reentrega
+            }
         }
     });
 }

@@ -125,37 +125,45 @@ export async function listarDados(req, res) {
 export async function solicitarExportacao(req, res) {
     const { nomeTabela, campo, tipoFiltro, valor } = req.body;
 
-    // Verifica se todos os campos obrigatórios estão presentes
-    if (!nomeTabela || !Array.isArray(campo) || !Array.isArray(tipoFiltro) || !Array.isArray(valor)) {
-        return res.status(400).json({ error: 'Parâmetros inválidos ou faltando' });
+    // Verifica se o campo nomeTabela é fornecido e válido
+    if (!nomeTabela) {
+        return res.status(400).json({ error: 'O campo nomeTabela é obrigatório' });
+    }
+
+    // Verifica se os arrays campo, tipoFiltro e valor têm tamanhos compatíveis caso sejam fornecidos
+    if ((campo || tipoFiltro || valor) && (!Array.isArray(campo) || !Array.isArray(tipoFiltro) || !Array.isArray(valor))) {
+        return res.status(400).json({ error: 'Parâmetros campo, tipoFiltro e valor devem ser arrays, se fornecidos' });
+    }
+    if (campo && (campo.length !== tipoFiltro.length || campo.length !== valor.length)) {
+        return res.status(400).json({ error: 'Parâmetros campo, tipoFiltro e valor devem ter o mesmo comprimento' });
     }
 
     // Criação da exportação com os dados fornecidos
     const novaExportacao = {
-        hash: uuidv4(),  // Geração do hash único para a exportação
-        filtros: { campo, tipoFiltro, valor },  // Filtros passados na requisição
-        situacao: 0,  // Estado inicial: Solicitada
-        dataCadastro: new Date(),  // Data de cadastro
-        dataGeracao: null,  // Data de geração será definida após o processamento
-        dataExclusao: null,  // Data de exclusão, se necessário
-        tentativasProcessamento: 0,  // Contador de tentativas de processamento
+        hash: uuidv4(),
+        filtros: { campo, tipoFiltro, valor },
+        situacao: 0,
+        dataCadastro: new Date(),
+        dataGeracao: new Date(),
+        dataExclusao: null,
+        tentativasProcessamento: 0,
     };
 
     let exportacao;
 
     try {
         if (process.env.SIGLA_DB === 'mongodb') {
-            // Se o banco for MongoDB, cria um novo registro na coleção MongoExportacao
+            // Cria um novo registro no MongoDB
             exportacao = new MongoExportacao(novaExportacao);
             await exportacao.save();
         } else {
-            // Se o banco for MySQL, usa o Sequelize para salvar o registro
+            // Se usa MySQL, cria o registro usando Sequelize
             const sequelize = getDatabase();
-            const ExportacaoSQL = defineExportacaoSQL(sequelize);  // Modelo de exportação no Sequelize
+            const ExportacaoSQL = defineExportacaoSQL(sequelize);
             exportacao = await ExportacaoSQL.create(novaExportacao);
         }
 
-        // Enviar uma mensagem para o RabbitMQ com os dados da exportação solicitada
+        // Envia uma mensagem para o RabbitMQ com os dados da exportação solicitada
         await sendToQueue({
             hash: exportacao.hash,
             nomeTabela,
@@ -172,6 +180,7 @@ export async function solicitarExportacao(req, res) {
     }
 }
 
+
 // Rota GET /v1/exportacao
 export async function listarExportacoes(req, res) {
     const {
@@ -187,9 +196,11 @@ export async function listarExportacoes(req, res) {
         numeroRegistros = 100
     } = req.query;
 
+    // Montando a consulta dinâmica
     let query = {};
     if (hash) query.hash = hash;
     if (situacao) query.situacao = parseInt(situacao);
+
     if (dataInicialCadastro || dataFinalCadastro) {
         query.dataCadastro = {};
         if (dataInicialCadastro) query.dataCadastro.$gte = new Date(dataInicialCadastro);
@@ -206,29 +217,50 @@ export async function listarExportacoes(req, res) {
         if (dataFinalExclusao) query.dataExclusao.$lte = new Date(dataFinalExclusao);
     }
 
-    let dados, totalRegistros;
-    if (process.env.SIGLA_DB === 'mongodb') {
-        dados = await MongoExportacao.find(query)
-            .limit(Number(numeroRegistros))
-            .skip((pagina - 1) * numeroRegistros);
-        totalRegistros = await MongoExportacao.countDocuments(query);
-    } else {
-        const sequelize = getDatabase();
-        const ExportacaoSQL = defineExportacaoSQL(sequelize);
-        dados = await ExportacaoSQL.findAll({
-            where: query,
-            limit: Number(numeroRegistros),
-            offset: (pagina - 1) * numeroRegistros
-        });
-        totalRegistros = await ExportacaoSQL.count({ where: query });
-    }
+    try {
+        let dados, totalRegistros;
 
-    res.json({
-        totalRegistros,
-        totalPaginas: Math.ceil(totalRegistros / numeroRegistros),
-        dados
-    });
+        if (process.env.SIGLA_DB === 'mongodb') {
+            // Consulta MongoDB
+            dados = await MongoExportacao.find(query)
+                .select('hash situacao tentativasProcessamento dataCadastro dataGeracao dataExclusao')
+                .limit(Number(numeroRegistros))
+                .skip((pagina - 1) * numeroRegistros);
+            totalRegistros = await MongoExportacao.countDocuments(query);
+        } else {
+            // Consulta MySQL (Sequelize)
+            const sequelize = getDatabase();
+            const ExportacaoSQL = defineExportacaoSQL(sequelize);
+
+            dados = await ExportacaoSQL.findAll({
+                where: query,
+                attributes: [
+                    'hash',
+                    'situacao',
+                    'tentativasProcessamento',
+                    'dataCadastro',
+                    'dataGeracao',
+                    'dataExclusao'
+                ],
+                limit: Number(numeroRegistros),
+                offset: (pagina - 1) * numeroRegistros
+            });
+            totalRegistros = await ExportacaoSQL.count({ where: query });
+        }
+
+        // Retorno formatado conforme os requisitos
+        res.json({
+            totalRegistros,
+            totalPaginas: Math.ceil(totalRegistros / numeroRegistros),
+            dados
+        });
+
+    } catch (error) {
+        console.error('Erro ao listar exportações:', error);
+        res.status(500).json({ error: 'Erro ao listar exportações' });
+    }
 }
+
 
 // Rota GET /v1/exportacao/:hashExportacao
 export async function obterExportacao(req, res) {
@@ -255,23 +287,34 @@ export async function baixarArquivo(req, res) {
     const { hashExportacao } = req.params;
     let exportacao;
 
-    if (process.env.SIGLA_DB === 'mongodb') {
-        exportacao = await MongoExportacao.findOne({ hash: hashExportacao });
-    } else {
-        const sequelize = getDatabase();
-        const ExportacaoSQL = defineExportacaoSQL(sequelize);
-        exportacao = await ExportacaoSQL.findOne({ where: { hash: hashExportacao } });
-    }
-
-    if (exportacao && exportacao.caminhoArquivo) {
-        const filePath = path.join(process.env.DIRETORIO_ARQUIVOS, exportacao.caminhoArquivo);
-        if (fs.existsSync(filePath)) {
-            res.download(filePath);
+    try {
+        // Verifica se o banco é MongoDB ou SQL
+        if (process.env.SIGLA_DB === 'mongodb') {
+            // Busca no MongoDB
+            exportacao = await MongoExportacao.findOne({ hash: hashExportacao });
         } else {
-            res.status(404).json({ error: 'Arquivo não encontrado' });
+            // Busca no MySQL (usando Sequelize)
+            const sequelize = getDatabase();
+            const ExportacaoSQL = defineExportacaoSQL(sequelize);
+            exportacao = await ExportacaoSQL.findOne({ where: { hash: hashExportacao } });
         }
-    } else {
-        res.status(404).json({ error: 'Exportação não encontrada' });
+
+        // Verifica se a exportação foi encontrada e possui o caminho do arquivo
+        if (exportacao && exportacao.caminhoArquivo) {
+            const filePath = path.join(process.env.DIRETORIO_ARQUIVOS, exportacao.caminhoArquivo);
+
+            // Verifica se o arquivo existe no diretório especificado
+            if (fs.existsSync(filePath)) {
+                return res.download(filePath);
+            } else {
+                return res.status(404).json({ error: 'Arquivo não encontrado no diretório especificado' });
+            }
+        } else {
+            return res.status(404).json({ error: 'Exportação não encontrada ou caminho do arquivo ausente' });
+        }
+    } catch (error) {
+        console.error('Erro ao baixar arquivo:', error);
+        return res.status(500).json({ error: 'Erro ao processar a solicitação de download' });
     }
 }
 
