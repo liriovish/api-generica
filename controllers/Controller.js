@@ -300,12 +300,14 @@ export async function baixarArquivo(req, res) {
         }
 
         // Verifica se a exportação foi encontrada e possui o caminho do arquivo
-        if (exportacao && exportacao.caminhoArquivo) {
-            const filePath = path.join(process.env.DIRETORIO_ARQUIVOS, exportacao.caminhoArquivo);
+        if (exportacao) {
+            const filePath = exportacao.caminhoArquivo
 
             // Verifica se o arquivo existe no diretório especificado
+            console.log(filePath);
             if (fs.existsSync(filePath)) {
                 return res.download(filePath);
+                
             } else {
                 return res.status(404).json({ error: 'Arquivo não encontrado no diretório especificado' });
             }
