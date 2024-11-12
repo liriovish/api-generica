@@ -30,5 +30,5 @@ const defineExportacaoSQL = (sequelize) => {
     }, { tableName: 'exportacoes', timestamps: false });
 };
 
-export const MongoExportacao = model('Exportacao', exportacaoSchema);
+export const MongoExportacao = model('exportacoes', exportacaoSchema);
 export { defineExportacaoSQL };
